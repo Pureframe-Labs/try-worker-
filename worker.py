@@ -13,10 +13,13 @@ import asyncio
 import pika
 import json
 import httpx
+import datetime as _dt
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 import utils
 import re
+import api as health_api
+from api import worker_state
 from difflib import get_close_matches
 from pdf2image import convert_from_path
 import pytesseract
@@ -297,11 +300,14 @@ async def init_primary_login():
     if not username or not password:
         raise RuntimeError("7-12 credentials not found")
     
+    worker_state["session_active"] = False
     success = await login_to_service("7-12 Satbara", utils.SEVEN_TWELVE_URL, username, password)
     
     if not success:
         raise RuntimeError("Failed to login to 7-12 Satbara")
     
+    worker_state["session_active"] = True
+    worker_state["last_heartbeat"] = __import__('datetime').datetime.utcnow().isoformat()
     log.info("✅ Primary login complete (Anchor tab session active)")
 
 async def ensure_logged_in():
@@ -347,14 +353,19 @@ async def keep_session_alive():
                 await anchor_page.evaluate(
                     "() => document.dispatchEvent(new Event('mousemove'))"
                 )
+
+                import datetime as _dt
+                worker_state["last_heartbeat"] = _dt.datetime.utcnow().isoformat()
                 log.info("🔄 Session heartbeat sent")
                 
                 # Check if session is still valid
                 if "login" in anchor_page.url.lower():
                     log.warning("⚠️ Session expired, attempting re-login...")
+                    worker_state["session_active"] = False
                     await init_primary_login()
                     
             except Exception as e:
+                worker_state["session_active"] = False
                 log.error(f"Session keep-alive error: {e}")
 
 # -------------------------------------------------
@@ -1038,6 +1049,7 @@ def handle_job(ch, method, properties, body):
     doc_type = data.get("doc_type", "unknown")
     
     log.info(f"📥 Received Job {req_id} ({doc_type}) from queue")
+    worker_state["status"] = f"processing:{doc_type}:{req_id}"
     
     try:
         # Run the async job in the existing event loop
@@ -1045,11 +1057,15 @@ def handle_job(ch, method, properties, body):
         
         # Acknowledge the message
         ch.basic_ack(delivery_tag=method.delivery_tag)
+        worker_state["jobs_processed"] = worker_state.get("jobs_processed", 0) + 1
         
     except Exception as e:
         log.error(f"❌ Critical error in handle_job for {req_id}: {e}")
         utils.update_db(doc_type, req_id, "failed")
         ch.basic_ack(delivery_tag=method.delivery_tag)
+        worker_state["jobs_failed"] = worker_state.get("jobs_failed", 0) + 1
+    finally:
+        worker_state["status"] = "idle"
 
 # -------------------------------------------------
 # MAIN ENTRY POINT
@@ -1070,6 +1086,12 @@ def setup_signal_handlers():
 async def run_worker():
     global connection, channel
     
+    # Start FastAPI health server in background (for Railway health checks)
+    api_port = int(os.getenv("PORT", "8080"))
+    health_api.start_api_server(port=api_port)
+    log.info(f"✅ Health API running on port {api_port} (GET /health)")
+    worker_state["status"] = "initializing"
+    
     # Ensure download dirs from env exist
     for env_key in ["DOWNLOAD_DIR_PROPERTYCARD", "DOWNLOAD_DIR_FERFAR", "DOWNLOAD_DIR_SATBARA", "DOWNLOAD_DIR_8A"]:
         p = os.getenv(env_key)
@@ -1079,6 +1101,7 @@ async def run_worker():
     await init_browser()
     await init_primary_login()
     loop.create_task(keep_session_alive())
+    worker_state["status"] = "idle"
     
     mq_url = os.getenv("RABBITMQ_URL")
     
@@ -1097,6 +1120,7 @@ async def run_worker():
 
             connection = pika.BlockingConnection(params)
             channel = connection.channel()
+            worker_state["rabbitmq_connected"] = True
             
             queues = ['property_card_queue', 'ferfar_queue', '7_12_queue', '8a_queue', 'extraction_queue']
             for queue in queues:
@@ -1109,20 +1133,32 @@ async def run_worker():
             log.info("✅ UNIFIED LAND RECORDS WORKER ONLINE")
             log.info("=" * 60)
             
-            channel.start_consuming()
+            # Run the blocking consumer in a separate thread so the 
+            # asyncio loop can keep running for heartbeats and API.
+            import threading
+            consumer_thread = threading.Thread(target=channel.start_consuming, daemon=True)
+            consumer_thread.start()
+            
+            # Keep the main async loop running
+            while consumer_thread.is_alive():
+                await asyncio.sleep(1)
             
         except pika.exceptions.ConnectionClosedByBroker:
+            worker_state["rabbitmq_connected"] = False
             log.warning("Connection closed by broker, retrying in 5s...")
             await asyncio.sleep(5)
             continue
         except pika.exceptions.AMQPChannelError as e:
+            worker_state["rabbitmq_connected"] = False
             log.error(f"Channel error: {e}, stopping...")
             break
         except pika.exceptions.AMQPConnectionError:
+            worker_state["rabbitmq_connected"] = False
             log.warning("Connection failed/lost, retrying in 5s...")
             await asyncio.sleep(5)
             continue
         except Exception as e:
+            worker_state["rabbitmq_connected"] = False
             log.error(f"Unexpected error in worker loop: {e}")
             await asyncio.sleep(5)
             continue

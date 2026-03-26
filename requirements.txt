@@ -4,4 +4,8 @@ python-dotenv==1.0.0
 httpx==0.25.0
 pytesseract==0.3.10
 pdf2image==1.17.0
-supabase==2.3.1
+# Upgraded to support new Supabase publishable key format (sb_publishable_...)
+supabase>=2.7.0
+# FastAPI health endpoint for production (Railway health checks)
+fastapi==0.111.0
+uvicorn==0.29.0

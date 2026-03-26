@@ -77,16 +77,49 @@ async def solve_captcha(image_bytes: bytes) -> str:
             log.error(f"❌ Unexpected Captcha Error: {e}")
             return ""
 
-from supabase import create_client, Client
-
 # Database config for Supabase Data API
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", os.getenv("SUPABASE_PUBLISHABLE_DEFAULT_KEY", ""))
+# Supports both legacy JWT keys (eyJ...) and new publishable keys (sb_publishable_...)
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY",
+               os.getenv("SUPABASE_ANON_KEY",
+               os.getenv("SUPABASE_PUBLISHABLE_DEFAULT_KEY", "")))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    log.warning("⚠️ SUPABASE_URL or SUPABASE_ANON_KEY is not set!")
+    log.warning("⚠️ SUPABASE_URL or SUPABASE_SERVICE_KEY/SUPABASE_ANON_KEY is not set!")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# Lazy Supabase client — initialized on first use to prevent import-time crashes
+_supabase_client = None
+
+def get_supabase():
+    """Return the Supabase client, initializing it lazily on first call."""
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.error("❌ Cannot create Supabase client: URL or KEY is missing.")
+        return None
+    try:
+        from supabase import create_client
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        log.info("✅ Supabase client initialized.")
+        return _supabase_client
+    except Exception as e:
+        log.error(f"❌ Failed to create Supabase client: {e}")
+        log.error("   → Check that SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY is a valid JWT (starts with eyJ...)")
+        return None
+
+# Keep a module-level alias for backward compatibility (resolves lazily)
+class _SupabaseLazyProxy:
+    """Thin proxy that forwards attribute access to the lazy client."""
+    def __getattr__(self, name):
+        client = get_supabase()
+        if client is None:
+            raise RuntimeError("Supabase client is not available. Check your API key.")
+        return getattr(client, name)
+    def __bool__(self):
+        return get_supabase() is not None
+
+supabase = _SupabaseLazyProxy()
 
 # -------------------------------------------------
 # DATABASE FUNCTIONS
@@ -113,7 +146,8 @@ def update_db(doc_type: str, req_id: int, status: str, filename: str = None) -> 
         log.error(f"❌ Invalid doc_type: {doc_type}")
         return
         
-    if not supabase:
+    client = get_supabase()
+    if not client:
         log.error("❌ Supabase client not initialized")
         return
     
@@ -126,7 +160,7 @@ def update_db(doc_type: str, req_id: int, status: str, filename: str = None) -> 
         if filename:
             update_data["pdf_url"] = filename
             
-        supabase.table(table_name).update(update_data).eq("id", req_id).execute()
+        client.table(table_name).update(update_data).eq("id", req_id).execute()
         
         log.info(f"✅ DB Updated → {doc_type.upper()} ID {req_id}: {status}")
     except Exception as e:
@@ -145,12 +179,13 @@ def get_db_status(doc_type: str, req_id: int) -> str:
     if not table_name:
         return "invalid_doc_type"
         
-    if not supabase:
+    client = get_supabase()
+    if not client:
         log.error("❌ Supabase client not initialized")
         return "error"
     
     try:
-        response = supabase.table(table_name).select("status").eq("id", req_id).execute()
+        response = client.table(table_name).select("status").eq("id", req_id).execute()
         data = response.data
         return data[0]["status"] if data else "not_found"
     except Exception as e:
