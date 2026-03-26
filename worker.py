@@ -750,7 +750,7 @@ async def process_7_12(data):
         
         # Select from dropdown
         survey_dropdown = worker_page.locator("#ddlsurvey")
-        await survey_dropdown.wait_for(state="visible", timeout=15000)
+        await survey_dropdown.wait_for(state="visible", timeout=30000)
         await survey_dropdown.select_option(index=1)
         
         # Wait for verification popups
@@ -1052,8 +1052,9 @@ def handle_job(ch, method, properties, body):
     worker_state["status"] = f"processing:{doc_type}:{req_id}"
     
     try:
-        # Run the async job in the existing event loop
-        loop.run_until_complete(process_job(data))
+        # Run the async job safely in the existing event loop from a different thread
+        future = asyncio.run_coroutine_threadsafe(process_job(data), loop)
+        future.result() # Wait for completion or error
         
         # Acknowledge the message
         ch.basic_ack(delivery_tag=method.delivery_tag)
